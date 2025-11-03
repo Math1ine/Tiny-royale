@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mini Royale — Single-file (HTML) Player vs AI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    html,body { margin:0; padding:0; height:100%; background:#111; color:#eee; font-family:Arial,Helvetica,sans-serif; }
+    #game-container { width:100%; height:100vh; display:flex; align-items:center; justify-content:center; }
+    .info { position:fixed; left:12px; bottom:12px; color:#ddd; font-size:13px; background:rgba(0,0,0,0.3); padding:8px 10px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div id="game-container"></div>
+  <div class="info">Click a card to select it, then click the lower play area to place. Press F5 to restart.</div>
+
+  <!-- Phaser 3 -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+
+  <!-- All game code in a single HTML file (no external JS files) -->
+  <script>
+  /* Mini Royale — single-file HTML (player vs AI)
+     - Self-contained Phaser 3 game
+     - No external modules; everything defined here
+     - Meant to be placed at repository root as index.html for GitHub Pages or opened via a local static server
+  */
+
+  (() => {
+    // --- Game entity classes ---
+    class Tower {
+      constructor(scene, x, y, ownerId) {
+        this.scene = scene;
+        this.x = x; this.y = y;
+        this.id = ownerId;
+        this.owner = ownerId.startsWith('ai') ? 'ai' : 'player';
+        this.maxHp = 300;
+        this.hp = this.maxHp;
+
+        const color = this.owner === 'player' ? 0x0066aa : 0xaa0033;
+        this.sprite = scene.add.rectangle(x, y, 120, 60, color).setStrokeStyle(2, 0x000000);
+        this.hpText = scene.add.text(x, y + 36, 'HP: ' + this.hp, { fontSize:'14px', color:'#fff' }).setOrigin(0.5, 0);
+      }
+
+      update(dt, units) {
+        if (this.hp <= 0) return;
+        // find nearest hostile unit
+        let nearest = null;
+        let md = Infinity;
+        for (const u of units) {
+          if (u.owner !== this.owner) {
+            const d = Phaser.Math.Distance.Between(this.x, this.y, u.x, u.y);
+            if (d < md) { md = d; nearest = u; }
+          }
+        }
+        if (nearest && md < 180) {
+          // deal DPS
+          nearest.hp -= 30 * (dt/1000);
+        }
+        this.hpText.setText('HP: ' + Math.max(0, Math.floor(this.hp)));
+        if (this.hp <= 0) {
+          this.sprite.setFillStyle(0x333333);
+          this.hpText.setText('Destroyed');
+        }
+      }
+    }
+
+    class Unit extends Phaser.GameObjects.Container {
+      constructor(scene, x, y, def, owner, towers) {
+        super(scene, x, y);
+        this.scene = scene;
+        this.def = def;
+        this.owner = owner;
+        this.maxHp = def.hp;
+        this.hp = def.hp;
+        this.dmg = def.dmg;
+        this.speed = def.speed;
+        this.towers = towers;
+        this.setSize(40, 40);
+
+        this.bodyGraphic = scene.add.circle(0, 0, 16, owner === 'player' ? 0x66ccff : 0xff7777);
+        this.hpBar = scene.add.rectangle(0, -24, 32, 6, 0x33ff33);
+
+        this.add([this.bodyGraphic, this.hpBar]);
+        scene.add.existing(this);
+
+        scene.physics.world.enable(this);
+        this.body.setCollideWorldBounds(false);
+        this.body.setVelocity(0, owner === 'player' ? -this.speed : this.speed);
+      }
+
+      update(dt) {
+        if (this.hp <= 0) { this.destroy(); return; }
+        // find nearest enemy unit
+        const others = this.scene.units.getChildren().filter(u => u !== this && u.owner !== this.owner);
+        let nearest = null, minD = Infinity;
+        for (const o of others) {
+          const d = Phaser.Math.Distance.Between(this.x, this.y, o.x, o.y);
+          if (d < minD) { minD = d; nearest = o; }
+        }
+        if (nearest && minD < 36) {
+          // fight
+          nearest.hp -= this.dmg * (dt/1000);
+          this.body.setVelocity(0);
+        } else {
+          // move toward enemy side
+          const vy = this.owner === 'player' ? -this.speed : this.speed;
+          this.body.setVelocity(0, vy);
+          // check for towers
+          const enemyTowers = this.towers.filter(t => t.owner !== this.owner && t.hp > 0);
+          if (enemyTowers.length) {
+            let targetT = enemyTowers[0], md = Phaser.Math.Distance.Between(this.x,this.y,targetT.x,targetT.y);
+            for (const t of enemyTowers) {
+              const d = Phaser.Math.Distance.Between(this.x,this.y,t.x,t.y);
+              if (d < md) { md = d; targetT = t; }
+            }
+            if (md < 36) {
+              targetT.hp -= this.dmg * (dt/1000) * 0.9;
+              this.body.setVelocity(0);
+            }
+          }
+        }
+
+        // update hp bar
+        const pct = Phaser.Math.Clamp(this.hp / this.maxHp, 0, 1);
+        this.hpBar.width = 32 * pct;
+        if (pct < 0.35) this.hpBar.fillColor = 0xff4444;
+      }
+    }
+
+    // --- Phaser Scene ---
+    class GameScene extends Phaser.Scene {
+      constructor() {
+        super({ key: 'GameScene' });
+        this.cardDefs = [
+          { key:'spear', cost:2, hp:30, dmg:6, speed:80 },
+          { key:'mini',  cost:3, hp:70, dmg:12, speed:50 },
+          { key:'tank',  cost:5, hp:200, dmg:22, speed:28 }
+        ];
+        this.playerElixir = 5; this.aiElixir = 5; this.maxElixir = 10;
+        this.elixirRegen = 1;
+      }
+
+      preload() {}
+
+      create() {
+        const w = this.scale.width, h = this.scale.height;
+        // playfield bg
+        this.add.rectangle(w/2, h/2, w-40, h-120, 0x222233).setStrokeStyle(2, 0x111111);
+
+        this.playerSpawnY = h - 120;
+        this.aiSpawnY = 120;
+
+        // towers
+        this.playerLeft = new Tower(this, 150, this.playerSpawnY, 'player-left');
+        this.playerRight = new Tower(this, w-150, this.playerSpawnY, 'player-right');
+        this.aiLeft = new Tower(this, 150, this.aiSpawnY, 'ai-left');
+        this.aiRight = new Tower(this, w-150, this.aiSpawnY, 'ai-right');
+
+        // unit group
+        this.units = this.add.group();
+
+        // UI texts
+        this.playerElixirText = this.add.text(12, h-46, 'Elixir: ' + this.playerElixir, { fontSize:'16px', color:'#fff' });
+        this.aiElixirText     = this.add.text(12, 12, 'AI Elixir: ' + this.aiElixir, { fontSize:'16px', color:'#fff' });
+
+        // hand (cards)
+        this.hand = [];
+        this.handContainer = this.add.container(w/2, h-56);
+        this.createHand();
+
+        // input
+        this.selectedCard = null;
+        this.input.on('gameobjectdown', (pointer, obj) => {
+          if (obj.cardRef) {
+            const card = obj.cardRef;
+            if (this.playerElixir >= card.cost) {
+              this.selectedCard = card;
+              // simple highlight
+              if (this.selRect) this.selRect.destroy();
+              this.selRect = this.add.rectangle(obj.x, obj.y, 84, 114).setStrokeStyle(3, 0xffff00).setDepth(10);
+            }
+          }
+        });
+
+        this.input.on('pointerdown', (pointer) => {
+          if (!this.selectedCard) return;
+          // only allow lower half for player deploy
+          if (pointer.y > this.scale.height/2 + 10 && pointer.y < this.scale.height - 80) {
+            if (this.playerElixir >= this.selectedCard.cost) {
+              this.playerElixir -= this.selectedCard.cost;
+              this.spawnUnit(this.selectedCard, pointer.x, this.playerSpawnY - 20, 'player');
+              this.updateUI();
+            }
+          }
+          this.clearSelection();
+        });
+
+        // AI
+        this.lastAItick = 0;
+
+        // timers
+        this.time.addEvent({ delay: 1000, loop: true, callback: this.regen.bind(this) });
+
+        // game over
+        this.gameOver = false;
+      }
+
+      createHand() {
+        // draw 4 cards
+        for (let i=0;i<4;i++) {
+          const def = this.cardDefs[Phaser.Math.Between(0,this.cardDefs.length-1)];
+          this.addCardToHand(def, i);
+        }
+      }
+
+      addCardToHand(def, index) {
+        const x = (index - 1.5) * 100;
+        const container = this.add.container(x, 0);
+        const bg = this.add.rectangle(0,0,80,110,0x141427).setStrokeStyle(2, 0x999999);
+        const icon = this.add.circle(0, -10, 22, def.key === 'tank' ? 0x888888 : (def.key==='mini'?0x66ff66:0xffff66));
+        const label = this.add.text(0, 32, def.key + '\\n' + def.cost, { fontSize:'14px', color:'#fff', align:'center' }).setOrigin(0.5);
+        container.add([bg, icon, label]);
+        container.setSize(80,110);
+        container.setInteractive(new Phaser.Geom.Rectangle(-40,-55,80,110), Phaser.Geom.Rectangle.Contains);
+        container.cardRef = def;
+        this.handContainer.add(container);
+        this.hand.push(container);
+      }
+
+      spawnUnit(def, x, y, owner) {
+        const u = new Unit(this, x, y, def, owner, [this.playerLeft, this.playerRight, this.aiLeft, this.aiRight]);
+        this.add.existing(u);
+        this.units.add(u);
+      }
+
+      regen() {
+        if (this.playerElixir < this.maxElixir) this.playerElixir = Math.min(this.maxElixir, this.playerElixir + this.elixirRegen);
+        if (this.aiElixir < this.maxElixir) this.aiElixir = Math.min(this.maxElixir, this.aiElixir + this.elixirRegen);
+        this.updateUI();
+      }
+
+      updateUI() {
+        this.playerElixirText.setText('Elixir: ' + Math.floor(this.playerElixir));
+        this.aiElixirText.setText('AI Elixir: ' + Math.floor(this.aiElixir));
+      }
+
+      clearSelection() {
+        this.selectedCard = null;
+        if (this.selRect) { this.selRect.destroy(); this.selRect = null; }
+      }
+
+      update(time, delta) {
+        if (this.gameOver) return;
+
+        // units update
+        this.units.getChildren().forEach(u => u.update(delta));
+
+        // towers update
+        [this.playerLeft, this.playerRight, this.aiLeft, this.aiRight].forEach(t => t.update(delta, this.units.getChildren()));
+
+        // cleanup dead
+        this.units.getChildren().forEach(u => {
+          if (u.hp <= 0 || u.x < -50 || u.x > this.scale.width + 50 || u.y < -80 || u.y > this.scale.height + 80) {
+            u.destroy();
+          }
+        });
+
+        // AI tick every 900-1400ms
+        if (time - this.lastAItick > 900) {
+          this.lastAItick = time + Phaser.Math.Between(0,500);
+          this.aiThink();
+        }
+
+        // check win/lose
+        if (this.playerLeft.hp <= 0 || this.playerRight.hp <= 0) { this.end('AI wins'); }
+        if (this.aiLeft.hp <= 0 || this.aiRight.hp <= 0) { this.end('Player wins'); }
+      }
+
+      aiThink() {
+        if (this.gameOver) return;
+        // simple defense: if player units near AI towers, play cheap defenders
+        const threats = this.units.getChildren().filter(u => u.owner === 'player' && u.y < this.scale.height/2 + 60);
+        if (threats.length > 0 && this.aiElixir >= 2) {
+          const affordable = this.cardDefs.filter(d => d.cost <= Math.floor(this.aiElixir));
+          const pick = affordable.length ? affordable[Phaser.Math.Between(0, affordable.length-1)] : null;
+          if (pick) {
+            const tx = Phaser.Math.Clamp(Phaser.Math.Between(120, this.scale.width-120), 80, this.scale.width-80);
+            this.aiElixir -= pick.cost;
+            this.spawnUnit(pick, tx, this.aiSpawnY + 40, 'ai');
+            this.updateUI();
+            return;
+          }
+        }
+        // otherwise push sometimes
+        if (Math.random() > 0.55 && this.aiElixir >= 3) {
+          const affordable = this.cardDefs.filter(d => d.cost <= Math.floor(this.aiElixir));
+          if (affordable.length) {
+            const pick = affordable[Phaser.Math.Between(0,affordable.length-1)];
+            const tx = Phaser.Math.Between(120, this.scale.width-120);
+            this.aiElixir -= pick.cost;
+            this.spawnUnit(pick, tx, this.aiSpawnY + 40, 'ai');
+            this.updateUI();
+          }
+        }
+      }
+
+      end(text) {
+        this.gameOver = true;
+        const w = this.scale.width, h = this.scale.height;
+        this.add.rectangle(w/2, h/2, 420, 160, 0x000000, 0.7);
+        this.add.text(w/2, h/2 - 10, text, { fontSize:'28px', color:'#fff' }).setOrigin(0.5);
+        this.add.text(w/2, h/2 + 30, 'Press F5 to restart', { fontSize:'16px', color:'#ccc' }).setOrigin(0.5);
+      }
+    }
+
+    // --- Phaser config & start ---
+    const config = {
+      type: Phaser.AUTO,
+      width: 900,
+      height: 600,
+      parent: 'game-container',
+      backgroundColor: '#0f0f14',
+      physics: { default:'arcade', arcade:{ debug:false } },
+      scene: [ GameScene ]
+    };
+
+    window.addEventListener('load', () => {
+      new Phaser.Game(config);
+    });
+
+  })();
+  </script>
+</body>
+</html>
